@@ -12,3 +12,13 @@ if (NOT CMAKE_BUILD_TYPE)
 endif ()
 
 add_executable(TickStream src/main.cpp)
+include(CTest)
+option(TICKSTREAM_BUILD_TESTS "Build unit tests" ON)
+
+if (TICKSTREAM_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif ()
+
+# Main server executable
+add_executable(tickstream_server src/main.cpp)
