@@ -22,3 +22,6 @@ gtest_discover_tests(tickstream_tests PROPERTIES TIMEOUT 10)
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 add_test(NAME protocol_python
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/protocol_python_test.py)
+add_test(NAME server_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/server_cli_test.py $<TARGET_FILE:tickstream_server>)
+set_tests_properties(protocol_python server_cli PROPERTIES TIMEOUT 15)
