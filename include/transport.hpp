@@ -7,6 +7,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -138,6 +139,9 @@ namespace tickstream {
         std::uint16_t port() const { return port_; }
         std::size_t client_count() const { return clients_.size(); }
         const TransportStats &stats() const { return stats_; }
+
+        // Snapshot-only poll: counts pending writers that the kernel currently marks non-writable.
+        std::optional<std::size_t> backpressured_clients() const;
 
     private:
         struct Connection;

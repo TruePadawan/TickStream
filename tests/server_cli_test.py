@@ -1,4 +1,6 @@
 """Exercises the executable's arguments, startup reporting, and graceful shutdown."""
+import json
+import tempfile
 import pathlib
 import selectors
 import socket
@@ -18,13 +20,22 @@ class ServerCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("--port", result.stdout)
 
+    def test_build_info(self):
+        """Build provenance is machine-readable and available without starting the server."""
+        result = subprocess.run([EXECUTABLE, "--build-info"], capture_output=True, text=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        info = json.loads(result.stdout)
+        self.assertEqual(info["cxx_standard"], 20)
+        self.assertIsInstance(info["sanitizers"], bool)
+        self.assertTrue(info["compiler"])
+
     def test_bad_arguments(self):
         """Invalid configuration exits nonzero with a standard-error diagnostic."""
         for args in (["--port", "-1"], ["--port", "65536"], ["--port", "1x"],
                      ["--address", "bad"], ["--max-clients", "0"],
                      ["--send-buffer-bytes", "99999999999999999999"],
                      ["--unknown", "1"], ["--port"], ["--rate", "0"],
-                     ["--rate", "1000001"], ["--queue-capacity", "0"], ["--mode", "invalid"]):
+                     ["--rate", "1000001"], ["--queue-capacity", "0"], ["--mode", "invalid"], ["--stats-interval-ms", "0"], ["--stats-interval-ms", "10001"]):
             with self.subTest(args=args):
                 result = subprocess.run([EXECUTABLE, *args], capture_output=True, text=True, timeout=3)
                 self.assertNotEqual(result.returncode, 0)
@@ -61,8 +72,9 @@ class ServerCliTests(unittest.TestCase):
 
     def test_startup_and_sigterm(self):
         """An ephemeral listener accepts connections and stops cleanly on SIGTERM."""
-        with subprocess.Popen([EXECUTABLE, "--port", "0"], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True) as process:
+        with tempfile.TemporaryDirectory() as folder, subprocess.Popen(
+                [EXECUTABLE, "--port", "0", "--stats-file", str(pathlib.Path(folder) / "stats.jsonl")],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
             try:
                 with selectors.DefaultSelector() as ready:
                     ready.register(process.stdout, selectors.EVENT_READ)
@@ -78,6 +90,11 @@ class ServerCliTests(unittest.TestCase):
                 self.assertEqual(process.returncode, 0, stderr)
                 self.assertIn("accepted=1", stdout)
                 self.assertIn("protocol_errors=1", stdout)
+                snapshots = [json.loads(line) for line in (pathlib.Path(folder) / "stats.jsonl").read_text().splitlines()]
+                self.assertEqual(snapshots[0]["kind"], "initial")
+                self.assertEqual(snapshots[-1]["kind"], "final")
+                self.assertEqual(snapshots[-1]["protocol_errors"], 1)
+                self.assertGreaterEqual(snapshots[-1]["timestamp_ns"], snapshots[0]["timestamp_ns"])
             finally:
                 if process.poll() is None:
                     process.kill()

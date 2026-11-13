@@ -25,3 +25,9 @@ add_test(NAME protocol_python
 add_test(NAME server_cli
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/server_cli_test.py $<TARGET_FILE:tickstream_server>)
 set_tests_properties(protocol_python server_cli PROPERTIES TIMEOUT 15)
+add_test(NAME benchmark_metrics
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_metrics_test.py)
+add_test(NAME benchmark_integration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/benchmark_test.py $<TARGET_FILE:tickstream_server>)
+set_tests_properties(benchmark_metrics PROPERTIES TIMEOUT 10)
+set_tests_properties(benchmark_integration PROPERTIES TIMEOUT 45)

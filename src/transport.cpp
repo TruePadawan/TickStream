@@ -10,6 +10,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -318,6 +319,22 @@ namespace tickstream {
             return;
         }
         update_interest(id);
+    }
+
+    std::optional<std::size_t> TcpServer::backpressured_clients() const {
+        std::vector<pollfd> writers;
+        writers.reserve(clients_.size());
+        for (const auto &[id, connection]: clients_) {
+            (void) id;
+            if (connection->output.size() > 0) writers.push_back({connection->socket.get(), POLLOUT, 0});
+        }
+        if (::poll(writers.data(), writers.size(), 0) == -1) {
+            if (errno == EINTR) return std::nullopt;
+            system_failure("poll output readiness");
+        }
+        return static_cast<std::size_t>(std::count_if(writers.begin(), writers.end(), [](const auto &writer) {
+            return (writer.revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) == 0;
+        }));
     }
 
     void TcpServer::poll_once(int timeout_ms) {

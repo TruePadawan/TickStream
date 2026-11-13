@@ -86,7 +86,8 @@ namespace tickstream {
 
     void MarketServer::start() {
         started_ = true;
-        next_batch_ns_ = monotonic_ns() + BATCH_NS;
+        generation_start_ns_ = monotonic_ns();
+        next_batch_ns_ = generation_start_ns_ + BATCH_NS;
     }
 
     void MarketServer::on_message(TcpServer &server, TcpServer::ClientId id, const protocol::Message &message) {

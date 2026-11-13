@@ -48,6 +48,10 @@ target_link_libraries(tickstream_core PRIVATE tickstream_build_options)
 
 add_executable(tickstream_server src/main.cpp)
 target_link_libraries(tickstream_server PRIVATE tickstream_core tickstream_build_options)
+target_compile_definitions(tickstream_server PRIVATE
+    TICKSTREAM_BUILD_TYPE="$<CONFIG>"
+    TICKSTREAM_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+    TICKSTREAM_SANITIZERS=$<BOOL:${TICKSTREAM_ENABLE_SANITIZERS}>)
 
 if (BUILD_TESTING AND TICKSTREAM_BUILD_TESTS)
     add_subdirectory(tests)

@@ -69,6 +69,9 @@ namespace tickstream {
 
         std::uint16_t port() const { return transport_.port(); }
         bool started() const { return started_; }
+        std::uint64_t generation_start_ns() const { return generation_start_ns_; }
+        std::size_t client_count() const { return transport_.client_count(); }
+        std::optional<std::size_t> backpressured_clients() const { return transport_.backpressured_clients(); }
         std::size_t subscription_count() const { return subscriptions_.size(); }
         const MarketStats &stats() const { return stats_; }
         const TransportStats &transport_stats() const { return transport_.stats(); }
@@ -85,6 +88,7 @@ namespace tickstream {
         TickGenerator generator_;
         MarketStats stats_;
         bool started_ = false;
+        std::uint64_t generation_start_ns_ = 0;
         std::uint64_t next_batch_ns_ = 0;
         std::uint64_t fraction_ = 0;
         // Declared last so callbacks cannot outlive application state during destruction.
