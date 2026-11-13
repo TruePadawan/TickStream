@@ -171,7 +171,7 @@ TEST(Transport, BlockedConsumerDoesNotBlockOtherConnections) {
         } else acknowledge(server, id, message);
     };
     TcpServer server(ServerConfig{
-                         .port = 0, .output_capacity = 512 * 1024,
+                         .port = 0, .output_capacity = 512 * 1024, .tick_queue_capacity = 8192,
                          .send_buffer_bytes = 4096
                      }, flood);
     auto slow = connect_client(server, 4096);
@@ -254,4 +254,22 @@ TEST(Transport, BrokenPeerIsReportedWithoutSigpipe) {
     const std::array<std::byte, 1> data{std::byte{42}};
     ASSERT_TRUE(output.enqueue(data));
     EXPECT_EQ(output.flush(sender.get(), 1), FlushStatus::Error);
+}
+
+// Tick completion counts advance only after the final byte reaches the socket.
+TEST(Transport, TickAccountingIncludesPartiallyWrittenFrames) {
+    int pair[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair), 0);
+    UniqueFd sender(pair[0]), receiver(pair[1]);
+    std::array<std::byte, MAX_FRAME_SIZE> frame{};
+    const auto size = encode(TickMsg{1, 1, 100, 102, 101, 0}, frame);
+    PendingWrites output(MAX_FRAME_SIZE);
+    ASSERT_TRUE(output.enqueue(std::span(frame).first(size), true));
+    EXPECT_EQ(output.flush(sender.get(), 7), FlushStatus::BudgetExhausted);
+    EXPECT_EQ(output.size(), size - 7);
+    EXPECT_EQ(output.pending_ticks(), 1);
+    EXPECT_EQ(output.completed_ticks(), 0);
+    EXPECT_EQ(output.flush(sender.get(), MAX_FRAME_SIZE), FlushStatus::Drained);
+    EXPECT_EQ(output.pending_ticks(), 0);
+    EXPECT_EQ(output.completed_ticks(), 1);
 }

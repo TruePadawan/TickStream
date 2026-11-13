@@ -1,4 +1,5 @@
 """Exercises the executable's arguments, startup reporting, and graceful shutdown."""
+import pathlib
 import selectors
 import socket
 import subprocess
@@ -22,11 +23,37 @@ class ServerCliTests(unittest.TestCase):
         for args in (["--port", "-1"], ["--port", "65536"], ["--port", "1x"],
                      ["--address", "bad"], ["--max-clients", "0"],
                      ["--send-buffer-bytes", "99999999999999999999"],
-                     ["--unknown", "1"], ["--port"]):
+                     ["--unknown", "1"], ["--port"], ["--rate", "0"],
+                     ["--rate", "1000001"], ["--queue-capacity", "0"]):
             with self.subTest(args=args):
                 result = subprocess.run([EXECUTABLE, *args], capture_output=True, text=True, timeout=3)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("tickstream_server:", result.stderr)
+
+    def test_python_client_subscribes_and_receives_ticks(self):
+        """The shipped client coordinates start, decodes prices, and checks sequences."""
+        client_script = pathlib.Path(__file__).resolve().parents[1] / "tools" / "client.py"
+        with subprocess.Popen([EXECUTABLE, "--port", "0", "--manual-start", "--rate", "200"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                with selectors.DefaultSelector() as ready:
+                    ready.register(process.stdout, selectors.EVENT_READ)
+                    self.assertTrue(ready.select(timeout=3), "No startup message")
+                port = int(process.stdout.readline().strip().rsplit(":", 1)[1])
+                result = subprocess.run([sys.executable, str(client_script), "--port", str(port),
+                                         "--tickers", "AAPL", "MSFT", "--start", "--count", "12"],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(len(lines), 12)
+                self.assertEqual({line.split()[0] for line in lines}, {"AAPL", "MSFT"})
+                process.terminate()
+                _, stderr = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 0, stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=3)
 
     def test_startup_and_sigterm(self):
         """An ephemeral listener accepts connections and stops cleanly on SIGTERM."""
