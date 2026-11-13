@@ -204,12 +204,48 @@ TEST(Market, TickQueueOverflowRemovesOnlyTheOwningSubscriptions) {
     ASSERT_TRUE(receive(server, subscribed.get()));
     request(subscribed.get(), StartMsg{});
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    while (server.transport_stats().tick_queue_overflows == 0 && std::chrono::steady_clock::now() < deadline) server.
-            poll_once(1);
+    while (server.transport_stats().tick_queue_overflows == 0 && std::chrono::steady_clock::now() < deadline)
+        server.
+                poll_once(1);
     EXPECT_EQ(server.transport_stats().tick_queue_overflows, 1);
     EXPECT_EQ(server.transport_stats().client_tick_high_water, 1);
     EXPECT_EQ(server.transport_stats().pending_ticks, 0);
     EXPECT_EQ(server.subscription_count(), 0);
     request(healthy.get(), UnsubscribeMsg{4});
     EXPECT_EQ(receive(server, healthy.get()), (std::optional<Message>{AckMsg{MsgType::Unsubscribe, 4}}));
+}
+
+// Conflation deliberately permits sequence gaps, including updates replaced within generation batches.
+TEST(Market, ConflatedGenerationReportsReplacementsAndIgnoresFifoTickLimit) {
+    MarketConfig config;
+    config.transport.port = 0;
+    config.transport.mode = DeliveryMode::Conflated;
+    config.transport.tick_queue_capacity = 1;
+    config.tick_rate = 10000;
+    config.manual_start = true;
+    MarketServer server(config);
+    auto client = connect_client(server);
+    for (const auto ticker: {1u, 2u}) {
+        request(client.get(), SubscribeMsg{ticker});
+        ASSERT_TRUE(receive(server, client.get()));
+    }
+    request(client.get(), StartMsg{});
+    std::array<std::uint64_t, 4> previous{};
+    bool gap_seen = false;
+    for (int i = 0; i < 6; ++i) {
+        const auto message = receive(server, client.get());
+        ASSERT_TRUE(message && std::holds_alternative<TickMsg>(*message));
+        const auto tick = std::get<TickMsg>(*message);
+        ASSERT_TRUE(tick.ticker_id == 1 || tick.ticker_id == 2);
+        auto &last = previous[tick.ticker_id - 1];
+        if (last != 0) {
+            EXPECT_GT(tick.seq, last);
+            gap_seen |= tick.seq > last + 1;
+        }
+        last = tick.seq;
+    }
+    EXPECT_TRUE(gap_seen);
+    EXPECT_GT(server.transport_stats().conflation_replacements, 0);
+    EXPECT_LE(server.transport_stats().client_tick_high_water, 3);
+    EXPECT_EQ(server.transport_stats().tick_queue_overflows, 0);
 }

@@ -264,7 +264,7 @@ TEST(Transport, TickAccountingIncludesPartiallyWrittenFrames) {
     std::array<std::byte, MAX_FRAME_SIZE> frame{};
     const auto size = encode(TickMsg{1, 1, 100, 102, 101, 0}, frame);
     PendingWrites output(MAX_FRAME_SIZE);
-    ASSERT_TRUE(output.enqueue(std::span(frame).first(size), true));
+    ASSERT_TRUE(output.enqueue(std::span(frame).first(size), 1));
     EXPECT_EQ(output.flush(sender.get(), 7), FlushStatus::BudgetExhausted);
     EXPECT_EQ(output.size(), size - 7);
     EXPECT_EQ(output.pending_ticks(), 1);
@@ -272,4 +272,64 @@ TEST(Transport, TickAccountingIncludesPartiallyWrittenFrames) {
     EXPECT_EQ(output.flush(sender.get(), MAX_FRAME_SIZE), FlushStatus::Drained);
     EXPECT_EQ(output.pending_ticks(), 0);
     EXPECT_EQ(output.completed_ticks(), 1);
+}
+
+// Repeated publications fill an unread socket while a healthy peer remains serviceable in both modes.
+TEST(Transport, SlowConsumerPoliciesRemainBoundedAndIsolated) {
+    for (const auto mode: {DeliveryMode::Full, DeliveryMode::Conflated}) {
+        SCOPED_TRACE(mode == DeliveryMode::Full ? "full" : "conflated");
+        TcpServer::ClientId slow_id = 0;
+        auto handler = [&](TcpServer &server, auto id, const Message &message) {
+            if (std::get<SubscribeMsg>(message).ticker_id == 1 && slow_id == 0) slow_id = id;
+            acknowledge(server, id, message);
+        };
+        TcpServer server(ServerConfig{
+                             .port = 0, .tick_queue_capacity = 16, .mode = mode,
+                             .send_buffer_bytes = 4096
+                         }, handler);
+        auto slow = connect_client(server, 4096);
+        auto healthy = connect_client(server);
+        send_message(slow.get(), SubscribeMsg{1});
+        ASSERT_TRUE(receive_message(server, slow.get()));
+        ASSERT_NE(slow_id, 0);
+        // The slow peer stops reading after its acknowledgement; its kernel window will fill.
+        std::uint64_t offers = 0;
+        for (std::uint64_t i = 1; i <= 40000; ++i) {
+            ++offers;
+            server.send(slow_id, TickMsg{
+                            (i - 1) / 4 + 1, static_cast<std::uint32_t>((i - 1) % 4 + 1),
+                            100, 102, 101, i
+                        });
+            server.poll_once(0);
+            if (server.stats().tick_queue_overflows != 0) break;
+            if (i % 100 == 0) {
+                // Input readiness forces a write attempt even when EPOLLOUT is withheld.
+                send_message(slow.get(), SubscribeMsg{1});
+                send_message(healthy.get(), SubscribeMsg{2});
+                EXPECT_EQ(receive_message(server, healthy.get()),
+                          (std::optional<Message>{AckMsg{MsgType::Subscribe, 2}}));
+            }
+            if (mode == DeliveryMode::Conflated && server.stats().blocked_writes > 0) break;
+        }
+        send_message(healthy.get(), SubscribeMsg{2});
+        EXPECT_EQ(receive_message(server, healthy.get()), (std::optional<Message>{AckMsg{MsgType::Subscribe, 2}}));
+        // Full mode can overflow while epoll withholds writable events.
+        // Conflated mode also probes writes through input events to verify EAGAIN explicitly.
+        if (mode == DeliveryMode::Full) {
+            EXPECT_EQ(server.stats().tick_queue_overflows, 1);
+            EXPECT_LE(server.stats().client_tick_high_water, 16);
+            EXPECT_EQ(server.stats().conflation_replacements, 0);
+            EXPECT_EQ(server.client_count(), 1);
+        } else {
+            EXPECT_EQ(server.stats().tick_queue_overflows, 0);
+            EXPECT_EQ(server.stats().output_overflows, 0);
+            EXPECT_GT(server.stats().conflation_replacements, 0);
+            EXPECT_LE(server.stats().client_tick_high_water, 5);
+            EXPECT_GT(server.stats().blocked_writes, 0);
+            EXPECT_LE(server.stats().pending_ticks, 5);
+            EXPECT_EQ(server.stats().tick_frames_written + server.stats().pending_ticks +
+                      server.stats().conflation_replacements, offers);
+            EXPECT_EQ(server.client_count(), 2);
+        }
+    }
 }
