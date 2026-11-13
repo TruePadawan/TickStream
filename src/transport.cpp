@@ -52,10 +52,11 @@ namespace tickstream {
         return *this;
     }
 
-    bool PendingWrites::enqueue(std::span<const std::byte> bytes) {
+    bool PendingWrites::enqueue(std::span<const std::byte> bytes, bool tick) {
         if (bytes.size() > capacity_ - size_) return false;
         if (!bytes.empty()) {
-            chunks_.emplace_back(bytes.begin(), bytes.end());
+            chunks_.push_back({std::vector<std::byte>(bytes.begin(), bytes.end()), tick});
+            if (tick) ++pending_ticks_;
             size_ += bytes.size();
         }
         return true;
@@ -64,7 +65,7 @@ namespace tickstream {
     FlushStatus PendingWrites::flush(int fd, std::size_t budget) {
         // Bound syscall attempts as well as bytes so repeated EINTR cannot monopolize a pass.
         for (std::size_t attempts = 0; !chunks_.empty() && budget > 0 && attempts < 1024; ++attempts) {
-            const auto &chunk = chunks_.front();
+            const auto &chunk = chunks_.front().bytes;
             const auto requested = std::min(chunk.size() - offset_, budget);
             const auto sent = ::send(fd, chunk.data() + offset_, requested, MSG_NOSIGNAL);
             if (sent < 0) {
@@ -82,6 +83,10 @@ namespace tickstream {
             size_ -= count;
             budget -= count;
             if (offset_ == chunk.size()) {
+                if (chunks_.front().tick) {
+                    --pending_ticks_;
+                    ++completed_ticks_;
+                }
                 chunks_.pop_front();
                 offset_ = 0;
             }
@@ -101,12 +106,12 @@ namespace tickstream {
         }
     };
 
-    TcpServer::TcpServer(ServerConfig config, MessageHandler handler)
-        : config_(std::move(config)), handler_(std::move(handler)),
+    TcpServer::TcpServer(ServerConfig config, MessageHandler handler, DisconnectHandler on_disconnect)
+        : config_(std::move(config)), handler_(std::move(handler)), on_disconnect_(std::move(on_disconnect)),
           listener_(checked_fd(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0), "socket")),
           epoll_(checked_fd(::epoll_create1(EPOLL_CLOEXEC), "epoll_create1")) {
-        if (config_.max_clients == 0 || config_.output_capacity < protocol::MAX_FRAME_SIZE || config_.send_buffer_bytes
-            < 0) {
+        if (config_.max_clients == 0 || config_.tick_queue_capacity == 0 ||
+            config_.output_capacity < protocol::MAX_FRAME_SIZE || config_.send_buffer_bytes < 0) {
             throw std::invalid_argument("Invalid connection or buffer limit");
         }
         set_option(listener_.get(), SOL_SOCKET, SO_REUSEADDR, 1);
@@ -168,8 +173,17 @@ namespace tickstream {
         const auto found = clients_.find(id);
         if (found == clients_.end()) return;
         // Closing the descriptor removes its epoll registration. Monotonic IDs reject stale events.
+        stats_.pending_bytes -= found->second->output.size();
+        stats_.pending_ticks -= found->second->output.pending_ticks();
         clients_.erase(found);
         ++stats_.disconnected;
+        if (on_disconnect_) on_disconnect_(id);
+    }
+
+    void TcpServer::reject_protocol(ClientId id) {
+        if (!clients_.contains(id)) return;
+        ++stats_.protocol_errors;
+        disconnect(id);
     }
 
     void TcpServer::update_interest(ClientId id) {
@@ -193,11 +207,22 @@ namespace tickstream {
         if (found == clients_.end()) return false;
         std::array<std::byte, protocol::MAX_FRAME_SIZE> frame{};
         const auto size = protocol::encode(message, frame);
-        if (!found->second->output.enqueue(std::span(frame).first(size))) {
+        auto& output = found->second->output;
+        const bool tick = std::holds_alternative<protocol::TickMsg>(message);
+        if (tick && output.pending_ticks() >= config_.tick_queue_capacity) {
+            ++stats_.tick_queue_overflows;
+            disconnect(id);
+            return false;
+        }
+        if (!output.enqueue(std::span(frame).first(size), tick)) {
             ++stats_.output_overflows;
             disconnect(id);
             return false;
         }
+        stats_.pending_bytes += size;
+        if (tick) ++stats_.pending_ticks;
+        stats_.client_byte_high_water = std::max(stats_.client_byte_high_water, output.size());
+        stats_.client_tick_high_water = std::max(stats_.client_tick_high_water, output.pending_ticks());
         update_interest(id);
         return true;
     }
@@ -252,9 +277,15 @@ namespace tickstream {
         const auto found = clients_.find(id);
         if (found == clients_.end()) return;
         auto &output = found->second->output;
+        const auto bytes_before = output.size();
+        const auto ticks_before = output.pending_ticks();
+        const auto completed_before = output.completed_ticks();
         const auto short_before = output.short_writes();
         const auto blocked_before = output.blocked_writes();
         const auto status = output.flush(found->second->socket.get(), WRITE_BUDGET);
+        stats_.pending_bytes -= bytes_before - output.size();
+        stats_.pending_ticks -= ticks_before - output.pending_ticks();
+        stats_.tick_frames_written += output.completed_ticks() - completed_before;
         stats_.short_writes += output.short_writes() - short_before;
         stats_.blocked_writes += output.blocked_writes() - blocked_before;
         if (status == FlushStatus::Error) {

@@ -42,7 +42,7 @@ if (TICKSTREAM_ENABLE_SANITIZERS)
     target_link_options(tickstream_build_options INTERFACE -fsanitize=address,undefined)
 endif ()
 
-add_library(tickstream_core STATIC src/protocol.cpp src/transport.cpp)
+add_library(tickstream_core STATIC src/protocol.cpp src/transport.cpp src/market.cpp)
 target_include_directories(tickstream_core PUBLIC include)
 target_link_libraries(tickstream_core PRIVATE tickstream_build_options)
 

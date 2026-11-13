@@ -43,17 +43,25 @@ namespace tickstream {
         explicit PendingWrites(std::size_t capacity) : capacity_(capacity) {
         }
 
-        bool enqueue(std::span<const std::byte> bytes);
+        bool enqueue(std::span<const std::byte> bytes, bool tick = false);
 
         FlushStatus flush(int fd, std::size_t budget);
 
         [[nodiscard]] std::size_t size() const { return size_; }
+        [[nodiscard]] std::size_t pending_ticks() const { return pending_ticks_; }
+        [[nodiscard]] std::uint64_t completed_ticks() const { return completed_ticks_; }
         [[nodiscard]] std::size_t short_writes() const { return short_writes_; }
         [[nodiscard]] std::size_t blocked_writes() const { return blocked_writes_; }
 
     private:
         std::size_t capacity_;
-        std::deque<std::vector<std::byte> > chunks_;
+        struct Chunk {
+            std::vector<std::byte> bytes;
+            bool tick;
+        };
+        std::deque<Chunk> chunks_;
+        std::size_t pending_ticks_ = 0;
+        std::uint64_t completed_ticks_ = 0;
         std::size_t offset_ = 0;
         std::size_t size_ = 0;
         std::size_t short_writes_ = 0;
@@ -66,6 +74,7 @@ namespace tickstream {
         std::uint16_t port = 9000; // Zero requests an ephemeral port for tests.
         std::size_t max_clients = 1024;
         std::size_t output_capacity = 64 * 1024;
+        std::size_t tick_queue_capacity = 256; // Includes a partially transmitted tick.
         int send_buffer_bytes = 0; // Zero preserves the kernel default.
     };
 
@@ -76,6 +85,12 @@ namespace tickstream {
         std::uint64_t disconnected = 0;
         std::uint64_t protocol_errors = 0;
         std::uint64_t output_overflows = 0;
+        std::uint64_t tick_queue_overflows = 0;
+        std::uint64_t tick_frames_written = 0;
+        std::size_t pending_bytes = 0;
+        std::size_t pending_ticks = 0;
+        std::size_t client_byte_high_water = 0;
+        std::size_t client_tick_high_water = 0;
         std::uint64_t short_writes = 0;
         std::uint64_t blocked_writes = 0;
     };
@@ -86,7 +101,10 @@ namespace tickstream {
         using ClientId = std::uint64_t;
         using MessageHandler = std::function<void(TcpServer &, ClientId, const protocol::Message &)>;
 
-        explicit TcpServer(ServerConfig config = {}, MessageHandler handler = {});
+        using DisconnectHandler = std::function<void(ClientId)>;
+
+        explicit TcpServer(ServerConfig config = {}, MessageHandler handler = {},
+                           DisconnectHandler on_disconnect = {});
 
         ~TcpServer();
 
@@ -101,6 +119,9 @@ namespace tickstream {
         bool send(ClientId id, const protocol::Message &message);
 
         void disconnect(ClientId id);
+
+        // Applies application-level protocol errors, such as an invalid Start state.
+        void reject_protocol(ClientId id);
 
         std::uint16_t port() const { return port_; }
         std::size_t client_count() const { return clients_.size(); }
@@ -119,6 +140,7 @@ namespace tickstream {
 
         ServerConfig config_;
         MessageHandler handler_;
+        DisconnectHandler on_disconnect_;
         UniqueFd listener_;
         UniqueFd epoll_;
         std::uint16_t port_ = 0;
