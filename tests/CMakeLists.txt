@@ -13,6 +13,12 @@ FetchContent_MakeAvailable(googletest)
 add_executable(tickstream_tests protocol_test.cpp)
 target_link_libraries(tickstream_tests PRIVATE GTest::gtest_main tickstream_core tickstream_build_options)
 target_compile_features(tickstream_tests PRIVATE cxx_std_20)
+target_compile_definitions(tickstream_tests PRIVATE
+    PROTOCOL_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/protocol_v1.txt")
 
 include(GoogleTest)
 gtest_discover_tests(tickstream_tests)
+
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+add_test(NAME protocol_python
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/protocol_python_test.py)

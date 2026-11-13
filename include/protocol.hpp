@@ -1,69 +1,93 @@
-#ifndef TICKSTREAM_PROTOCOL_H
-#define TICKSTREAM_PROTOCOL_H
+#ifndef TICKSTREAM_PROTOCOL_HPP
+#define TICKSTREAM_PROTOCOL_HPP
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
-#include <string>
+#include <optional>
+#include <span>
+#include <string_view>
 #include <variant>
-#include <vector>
 
 namespace protocol {
-    // Constants
-    constexpr size_t HEADER_SIZE = 3;
-    constexpr size_t MAX_PAYLOAD = 256;
-    constexpr size_t MAX_TICKERS = 4096;
+    inline constexpr std::uint8_t VERSION = 1;
+    inline constexpr std::size_t HEADER_SIZE = 4;
+    inline constexpr std::size_t MAX_PAYLOAD = 44;
+    inline constexpr std::size_t MAX_FRAME_SIZE = HEADER_SIZE + MAX_PAYLOAD;
+    inline constexpr std::int64_t PRICE_SCALE = 10'000;
+    inline constexpr std::array<std::string_view, 4> TICKERS{"AAPL", "MSFT", "GOOG", "AMZN"};
 
-    // Message type identifiers
-    enum class MsgType : uint8_t {
-        SUBSCRIBE = 1,
-        UNSUBSCRIBE = 2,
-        TICK = 3,
-        HEARTBEAT = 4
+    enum class MsgType : std::uint8_t {
+        Subscribe = 1, Unsubscribe = 2, Tick = 3, Ack = 4, Start = 5
     };
 
-    // Tick payload
-    struct TickMsg {
-        uint64_t seq;
-        uint32_t ticker_id;
-        // Prices are in cents
-        int64_t bid;
-        int64_t ask;
-        int64_t last;
-        uint64_t timestamp_ns; // Nanoseconds since epoch
-    };
-
-    // Subscribe payload
+    // Requests future updates for one ticker.
     struct SubscribeMsg {
-        uint32_t ticker_id;
+        std::uint32_t ticker_id;
+
+        bool operator==(const SubscribeMsg &) const = default;
     };
 
-    // Unsubscribe payload
+    // Stops new updates from being queued for one ticker.
     struct UnsubscribeMsg {
-        uint32_t ticker_id;
+        std::uint32_t ticker_id;
+
+        bool operator==(const UnsubscribeMsg &) const = default;
     };
 
-    // Heartbeat payload, it's just for checking if the connection is alive
-    struct HeartbeatMsg {
+    // Carries one price update and its per-ticker sequence number.
+    struct TickMsg {
+        std::uint64_t seq;
+        std::uint32_t ticker_id;
+        std::int64_t bid;
+        std::int64_t ask;
+        std::int64_t last;
+        std::uint64_t timestamp_ns; // Linux CLOCK_MONOTONIC, not wall-clock time.
+        bool operator==(const TickMsg &) const = default;
     };
 
-    using Message = std::variant<TickMsg, SubscribeMsg, UnsubscribeMsg, HeartbeatMsg>;
+    // Confirms that a subscription request has been applied.
+    struct AckMsg {
+        MsgType request_type;
+        std::uint32_t ticker_id;
+
+        bool operator==(const AckMsg &) const = default;
+    };
+
+    // Triggers generation once in manual-start benchmark mode.
+    struct StartMsg {
+        bool operator==(const StartMsg &) const = default;
+    };
+
+    using Message = std::variant<SubscribeMsg, UnsubscribeMsg, TickMsg, AckMsg, StartMsg>;
 
     enum class DecodeStatus { Ok, NeedMoreData, Error };
 
+    enum class DecodeError { None, InvalidVersion, UnknownType, InvalidLength, InvalidPayload };
+
+    // Reports one decoded frame or why the caller cannot consume it yet.
     struct DecodeResult {
         DecodeStatus status;
-        size_t consumed; // bytes used when status is Ok
-        Message message; // valid only when status is Ok
+        std::size_t consumed = 0;
+        std::optional<Message> message;
+        DecodeError error = DecodeError::None;
     };
 
-    size_t encode(const TickMsg &message, std::byte *out);
+    // Checks membership in the fixed ticker catalog.
+    bool valid_ticker(std::uint32_t ticker_id);
 
-    size_t encode(const SubscribeMsg &message, std::byte *out);
+    // Maps a message variant to its wire identifier.
+    MsgType message_type(const Message &message);
 
-    size_t encode(const UnsubscribeMsg &message, std::byte *out);
+    // Returns frame size, including the header, without validating payload values.
+    std::size_t encoded_size(const Message &message);
 
-    size_t encode(const HeartbeatMsg &message, std::byte *out);
+    // Serializes one message into caller-owned storage.
+    // Throws std::invalid_argument for invalid payloads or std::length_error for short output.
+    // Validates before writing; bytes after the encoded frame are untouched.
+    std::size_t encode(const Message &message, std::span<std::byte> out);
 
-    DecodeResult decode(const std::byte *data, size_t len);
+    // Decodes at most one frame. Non-Ok results consume no bytes and contain no message.
+    DecodeResult decode(std::span<const std::byte> data);
 } // namespace protocol
-
-#endif //TICKSTREAM_PROTOCOL_H
+#endif
