@@ -53,7 +53,7 @@ namespace tickstream {
     struct MarketStats {
         std::uint64_t scheduled_ticks = 0;
         std::uint64_t generated_ticks = 0;
-        std::uint64_t enqueued_deliveries = 0;
+        std::uint64_t accepted_tick_offers = 0; // Includes replacements, not just new queue entries.
         std::uint64_t skipped_ticks = 0;
         std::uint64_t delayed_batches = 0;
         std::uint64_t max_generation_lateness_ns = 0;

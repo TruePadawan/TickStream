@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--tickers", nargs="+", choices=list(p.TICKERS.values()), default=["AAPL"])
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--timeout", type=float, default=5)
+    parser.add_argument("--allow-gaps", action="store_true",
+                        help="Permit increasing sequence gaps from conflation; still reject duplicates/reordering")
     parser.add_argument("--start", action="store_true", help="Trigger a --manual-start server once")
     args = parser.parse_args()
     if args.count <= 0 or not 0 < args.timeout < float("inf"):
@@ -73,6 +75,7 @@ def main():
         waiting = set(requested)
         sequences = {}
         received = 0
+        sequence_gaps = 0
         while waiting or received < args.count:
             message = client.receive()
             if isinstance(message, p.Ack):
@@ -85,13 +88,20 @@ def main():
                 if message.ticker_id not in requested:
                     raise ValueError("Received an unsubscribed ticker")
                 previous = sequences.get(message.ticker_id)
-                if previous is not None and message.seq != previous + 1:
-                    raise ValueError(f"Sequence gap for {p.TICKERS[message.ticker_id]}")
+                if previous is not None:
+                    if message.seq <= previous:
+                        raise ValueError(f"Duplicate or decreasing sequence for {p.TICKERS[message.ticker_id]}")
+                    gap = message.seq - previous - 1
+                    if gap and not args.allow_gaps:
+                        raise ValueError(f"Sequence gap for {p.TICKERS[message.ticker_id]}")
+                    sequence_gaps += gap
                 sequences[message.ticker_id] = message.seq
                 received += 1
                 print(f"{p.TICKERS[message.ticker_id]} seq={message.seq} "
                       f"bid={price_text(message.bid)} ask={price_text(message.ask)} "
                       f"last={price_text(message.last)}")
+        if args.allow_gaps:
+            print(f"Sequence gaps observed: {sequence_gaps} (permitted)", file=sys.stderr)
     except (OSError, ValueError, ConnectionError) as error:
         print(f"client: {error}", file=sys.stderr)
         return 1

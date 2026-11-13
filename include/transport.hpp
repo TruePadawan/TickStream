@@ -35,19 +35,25 @@ namespace tickstream {
         int fd_;
     };
 
+    enum class DeliveryMode { Full, Conflated };
+
     enum class FlushStatus { Drained, Blocked, BudgetExhausted, Error };
 
-    // Bounded owned bytes awaiting transmission, with an offset for partial writes.
+    // Bounded output with FIFO controls, optional tick replacement, and partial-write state.
     class PendingWrites {
     public:
-        explicit PendingWrites(std::size_t capacity) : capacity_(capacity) {
+        explicit PendingWrites(std::size_t capacity, DeliveryMode mode = DeliveryMode::Full)
+            : capacity_(capacity), mode_(mode) {
         }
 
-        bool enqueue(std::span<const std::byte> bytes, bool tick = false);
+        // Ticker zero denotes control/raw bytes; a nonzero ID identifies a complete tick frame.
+        // Conflation replaces only matching ticks whose first byte has not been sent.
+        bool enqueue(std::span<const std::byte> bytes, std::uint32_t ticker_id = 0);
 
         FlushStatus flush(int fd, std::size_t budget);
 
         [[nodiscard]] std::size_t size() const { return size_; }
+        [[nodiscard]] std::uint64_t replacements() const { return replacements_; }
         [[nodiscard]] std::size_t pending_ticks() const { return pending_ticks_; }
         [[nodiscard]] std::uint64_t completed_ticks() const { return completed_ticks_; }
         [[nodiscard]] std::size_t short_writes() const { return short_writes_; }
@@ -55,26 +61,31 @@ namespace tickstream {
 
     private:
         std::size_t capacity_;
+        DeliveryMode mode_;
+
         struct Chunk {
             std::vector<std::byte> bytes;
-            bool tick;
+            std::uint32_t ticker_id;
         };
+
         std::deque<Chunk> chunks_;
         std::size_t pending_ticks_ = 0;
         std::uint64_t completed_ticks_ = 0;
+        std::uint64_t replacements_ = 0;
         std::size_t offset_ = 0;
         std::size_t size_ = 0;
         std::size_t short_writes_ = 0;
         std::size_t blocked_writes_ = 0;
     };
 
-    // Transport limits; tick delivery policies are added above this layer later.
+    // Transport limits and the per-client tick delivery policy.
     struct ServerConfig {
         std::string address = "127.0.0.1";
         std::uint16_t port = 9000; // Zero requests an ephemeral port for tests.
         std::size_t max_clients = 1024;
         std::size_t output_capacity = 64 * 1024;
-        std::size_t tick_queue_capacity = 256; // Includes a partially transmitted tick.
+        std::size_t tick_queue_capacity = 256; // Full mode only; includes a partially sent tick.
+        DeliveryMode mode = DeliveryMode::Full;
         int send_buffer_bytes = 0; // Zero preserves the kernel default.
     };
 
@@ -87,6 +98,7 @@ namespace tickstream {
         std::uint64_t output_overflows = 0;
         std::uint64_t tick_queue_overflows = 0;
         std::uint64_t tick_frames_written = 0;
+        std::uint64_t conflation_replacements = 0;
         std::size_t pending_bytes = 0;
         std::size_t pending_ticks = 0;
         std::size_t client_byte_high_water = 0;

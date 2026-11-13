@@ -52,11 +52,25 @@ namespace tickstream {
         return *this;
     }
 
-    bool PendingWrites::enqueue(std::span<const std::byte> bytes, bool tick) {
+    bool PendingWrites::enqueue(std::span<const std::byte> bytes, std::uint32_t ticker_id) {
+        if (ticker_id != 0 && (!protocol::valid_ticker(ticker_id) || bytes.size() != protocol::MAX_FRAME_SIZE)) {
+            throw std::invalid_argument("Tick output requires a catalog ID and one complete tick frame");
+        }
+        if (mode_ == DeliveryMode::Conflated && ticker_id != 0) {
+            for (auto it = chunks_.begin(); it != chunks_.end(); ++it) {
+                if (it == chunks_.begin() && offset_ != 0) continue;
+                if (it->ticker_id == ticker_id) {
+                    // Keeping this slot's position preserves fairness for other pending tickers.
+                    it->bytes.assign(bytes.begin(), bytes.end());
+                    ++replacements_;
+                    return true;
+                }
+            }
+        }
         if (bytes.size() > capacity_ - size_) return false;
         if (!bytes.empty()) {
-            chunks_.push_back({std::vector<std::byte>(bytes.begin(), bytes.end()), tick});
-            if (tick) ++pending_ticks_;
+            chunks_.push_back({.bytes = std::vector(bytes.begin(), bytes.end()), .ticker_id = ticker_id});
+            if (ticker_id != 0) ++pending_ticks_;
             size_ += bytes.size();
         }
         return true;
@@ -83,7 +97,7 @@ namespace tickstream {
             size_ -= count;
             budget -= count;
             if (offset_ == chunk.size()) {
-                if (chunks_.front().tick) {
+                if (chunks_.front().ticker_id != 0) {
                     --pending_ticks_;
                     ++completed_ticks_;
                 }
@@ -101,7 +115,8 @@ namespace tickstream {
         PendingWrites output;
         bool read_closed = false;
 
-        Connection(UniqueFd fd, std::size_t capacity) : socket(std::move(fd)), output(capacity) {
+        Connection(UniqueFd fd, std::size_t capacity, DeliveryMode mode)
+            : socket(std::move(fd)), output(capacity, mode) {
             input.reserve(READ_CAPACITY);
         }
     };
@@ -111,7 +126,8 @@ namespace tickstream {
           listener_(checked_fd(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0), "socket")),
           epoll_(checked_fd(::epoll_create1(EPOLL_CLOEXEC), "epoll_create1")) {
         if (config_.max_clients == 0 || config_.tick_queue_capacity == 0 ||
-            config_.output_capacity < protocol::MAX_FRAME_SIZE || config_.send_buffer_bytes < 0) {
+            config_.output_capacity < protocol::MAX_FRAME_SIZE || config_.send_buffer_bytes < 0 ||
+            (config_.mode != DeliveryMode::Full && config_.mode != DeliveryMode::Conflated)) {
             throw std::invalid_argument("Invalid connection or buffer limit");
         }
         set_option(listener_.get(), SOL_SOCKET, SO_REUSEADDR, 1);
@@ -125,14 +141,16 @@ namespace tickstream {
             system_failure("bind");
         if (::listen(listener_.get(), SOMAXCONN) == -1) system_failure("listen");
         socklen_t length = sizeof(address);
-        if (::getsockname(listener_.get(), reinterpret_cast<sockaddr *>(&address), &length) == -1) system_failure(
-            "getsockname");
+        if (::getsockname(listener_.get(), reinterpret_cast<sockaddr *>(&address), &length) == -1)
+            system_failure(
+                "getsockname");
         port_ = ntohs(address.sin_port);
         epoll_event event{};
         event.events = EPOLLIN;
         event.data.u64 = 0;
-        if (::epoll_ctl(epoll_.get(), EPOLL_CTL_ADD, listener_.get(), &event) == -1) system_failure(
-            "epoll add listener");
+        if (::epoll_ctl(epoll_.get(), EPOLL_CTL_ADD, listener_.get(), &event) == -1)
+            system_failure(
+                "epoll add listener");
     }
 
     TcpServer::~TcpServer() = default;
@@ -151,19 +169,21 @@ namespace tickstream {
             }
             try {
                 set_option(socket.get(), IPPROTO_TCP, TCP_NODELAY, 1);
-                if (config_.send_buffer_bytes > 0) set_option(socket.get(), SOL_SOCKET, SO_SNDBUF,
-                                                              config_.send_buffer_bytes);
+                if (config_.send_buffer_bytes > 0)
+                    set_option(socket.get(), SOL_SOCKET, SO_SNDBUF,
+                               config_.send_buffer_bytes);
             } catch (const std::system_error &) {
                 ++stats_.rejected;
                 continue; // A failed peer setup must not stop the listener.
             }
             const auto id = next_id_++;
-            auto connection = std::make_unique<Connection>(std::move(socket), config_.output_capacity);
+            auto connection = std::make_unique<Connection>(std::move(socket), config_.output_capacity, config_.mode);
             epoll_event event{};
             event.events = EPOLLIN | EPOLLRDHUP;
             event.data.u64 = id;
-            if (::epoll_ctl(epoll_.get(), EPOLL_CTL_ADD, connection->socket.get(), &event) == -1) system_failure(
-                "epoll add client");
+            if (::epoll_ctl(epoll_.get(), EPOLL_CTL_ADD, connection->socket.get(), &event) == -1)
+                system_failure(
+                    "epoll add client");
             clients_.emplace(id, std::move(connection));
             ++stats_.accepted;
         }
@@ -198,8 +218,9 @@ namespace tickstream {
         event.events = connection.read_closed ? 0u : static_cast<std::uint32_t>(EPOLLIN | EPOLLRDHUP);
         if (connection.output.size() > 0) event.events |= EPOLLOUT;
         event.data.u64 = id;
-        if (::epoll_ctl(epoll_.get(), EPOLL_CTL_MOD, connection.socket.get(), &event) == -1) system_failure(
-            "epoll modify client");
+        if (::epoll_ctl(epoll_.get(), EPOLL_CTL_MOD, connection.socket.get(), &event) == -1)
+            system_failure(
+                "epoll modify client");
     }
 
     bool TcpServer::send(ClientId id, const protocol::Message &message) {
@@ -207,20 +228,24 @@ namespace tickstream {
         if (found == clients_.end()) return false;
         std::array<std::byte, protocol::MAX_FRAME_SIZE> frame{};
         const auto size = protocol::encode(message, frame);
-        auto& output = found->second->output;
-        const bool tick = std::holds_alternative<protocol::TickMsg>(message);
-        if (tick && output.pending_ticks() >= config_.tick_queue_capacity) {
+        auto &output = found->second->output;
+        const auto *tick = std::get_if<protocol::TickMsg>(&message);
+        const auto bytes_before = output.size();
+        const auto ticks_before = output.pending_ticks();
+        const auto replaced_before = output.replacements();
+        if (tick && config_.mode == DeliveryMode::Full && output.pending_ticks() >= config_.tick_queue_capacity) {
             ++stats_.tick_queue_overflows;
             disconnect(id);
             return false;
         }
-        if (!output.enqueue(std::span(frame).first(size), tick)) {
+        if (!output.enqueue(std::span(frame).first(size), tick ? tick->ticker_id : 0)) {
             ++stats_.output_overflows;
             disconnect(id);
             return false;
         }
-        stats_.pending_bytes += size;
-        if (tick) ++stats_.pending_ticks;
+        stats_.pending_bytes += output.size() - bytes_before;
+        stats_.pending_ticks += output.pending_ticks() - ticks_before;
+        stats_.conflation_replacements += output.replacements() - replaced_before;
         stats_.client_byte_high_water = std::max(stats_.client_byte_high_water, output.size());
         stats_.client_tick_high_water = std::max(stats_.client_tick_high_water, output.pending_ticks());
         update_interest(id);

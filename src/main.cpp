@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
             if (option == "--help") {
                 std::cout << "Usage: tickstream_server [--address IPv4] [--port 0..65535]\n"
                         "  [--max-clients N] [--output-capacity BYTES] [--send-buffer-bytes N]\n"
-                        "  [--rate TICKS_PER_SECOND] [--seed N] [--queue-capacity TICKS] [--manual-start]\n";
+                        "  [--rate TICKS_PER_SECOND] [--seed N] [--queue-capacity TICKS] [--manual-start] [--mode full|conflated]\n";
                 return 0;
             }
 
@@ -64,7 +64,11 @@ int main(int argc, char **argv) {
             } else if (option == "--rate") config.tick_rate = number(value);
             else if (option == "--seed") config.seed = number(value);
             else if (option == "--queue-capacity") config.transport.tick_queue_capacity = number(value);
-            else throw std::invalid_argument("Unknown option");
+            else if (option == "--mode") {
+                if (value == "full") config.transport.mode = tickstream::DeliveryMode::Full;
+                else if (value == "conflated") config.transport.mode = tickstream::DeliveryMode::Conflated;
+                else throw std::invalid_argument("Mode must be full or conflated");
+            } else throw std::invalid_argument("Unknown option");
         }
 
         // Request graceful shutdown on Ctrl+C or process termination.
@@ -83,10 +87,11 @@ int main(int argc, char **argv) {
         std::cout << "Stopped: accepted=" << stats.accepted << " rejected=" << stats.rejected
                 << " protocol_errors=" << stats.protocol_errors
                 << " generated=" << market.generated_ticks << " scheduled=" << market.scheduled_ticks
-                << " skipped=" << market.skipped_ticks << " enqueued=" << market.enqueued_deliveries
+                << " skipped=" << market.skipped_ticks << " accepted_tick_offers=" << market.accepted_tick_offers
                 << " delayed_batches=" << market.delayed_batches
                 << " max_generation_lateness_ns=" << market.max_generation_lateness_ns
                 << " tick_frames_written=" << stats.tick_frames_written
+                << " replacements=" << stats.conflation_replacements
                 << " queue_overflows=" << stats.tick_queue_overflows
                 << " byte_overflows=" << stats.output_overflows
                 << " client_tick_high_water=" << stats.client_tick_high_water

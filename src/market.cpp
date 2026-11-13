@@ -123,7 +123,7 @@ namespace tickstream {
             for (auto it = recipients.begin(); it != recipients.end();) {
                 // Queue overflow can synchronously erase this subscriber during send().
                 const auto id = *it++;
-                if (transport_.send(id, tick)) ++stats_.enqueued_deliveries;
+                if (transport_.send(id, tick)) ++stats_.accepted_tick_offers;
             }
         }
     }
