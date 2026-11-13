@@ -7,3 +7,6 @@ __pycache__/
 .venv/
 *.log
 /Testing/
+
+# Generated benchmark measurements stay local.
+/bench/results/

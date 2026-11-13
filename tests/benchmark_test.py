@@ -29,6 +29,8 @@ class BenchmarkTests(unittest.TestCase):
         """Every spawned server must have exited, including after startup/validation failure."""
         for run in report["runs"]:
             self.assertFalse(Path(f"/proc/{run['server_pid']}").exists())
+            for pid in run.get("worker_pids", []):
+                self.assertFalse(Path(f"/proc/{pid}").exists())
 
     def test_healthy_repeated_full_delivery(self):
         """Two repetitions produce nonzero decoded rates and separate measured server intervals."""
@@ -51,7 +53,7 @@ class BenchmarkTests(unittest.TestCase):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
                 result, report = self.invoke(folder, "--clients", "3", "--rate", "5000", "--duration", ".8",
                                              "--mode", mode, "--slow-client", "--slow-pause", ".45",
-                                             "--send-buffer-bytes", "4096", "--queue-capacity", "128")
+                                             "--send-buffer-bytes", "4096", "--queue-capacity", "128", "--workers", "2")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr + str([r.get("errors") for r in report.get("runs", [])]))
                 run = report["runs"][0]
                 self.assertEqual(run["groups"]["healthy"]["clients"], 2)
@@ -68,6 +70,19 @@ class BenchmarkTests(unittest.TestCase):
                     self.assertGreater(run["server_lifetime_final"]["conflation_replacements"], 0)
                     self.assertGreater(run["groups"]["slow"]["sequence_gaps"], 0)
                 self.assert_cleaned_up(report)
+
+    def test_multiple_client_workers(self):
+        """Worker processes preserve per-client histograms and exit after each repetition."""
+        with tempfile.TemporaryDirectory() as folder:
+            result, report = self.invoke(folder, "--clients", "4", "--workers", "2", "--repeats", "2")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr + str([r.get("errors") for r in report["runs"]]))
+            for run in report["runs"]:
+                self.assertEqual(len(run["worker_pids"]), 2)
+                self.assertEqual(len(run["worker_resources"]), 2)
+                self.assertGreater(run["groups"]["healthy"]["decoded_ticks"], 0)
+                self.assertEqual(run["groups"]["healthy"]["sequence_gaps"], 0)
+                self.assertIsNotNone(run["harness_total_resources"])
+            self.assert_cleaned_up(report)
 
     def test_startup_disconnect_is_not_a_successful_zero_run(self):
         """Exceeding the server connection limit records an incomplete setup and null throughput."""

@@ -154,17 +154,25 @@ async def read_client(client, args, start_ns, end_ns, abort):
         abort.set()
 
 
-async def monitor(process, samples, abort, interval):
+async def monitor(process, samples, abort, interval, workers=(), end_ns=None):
     """Sample server/harness CPU and RSS and record scheduler delay, without unbounded queues."""
     next_ns = clock_ns()
     while True:
         now = clock_ns()
+        if end_ns is not None and now >= end_ns:
+            return
         if process.returncode is not None:
             abort.set()
             return
         try:
-            samples.append({"timestamp_ns": now, "scheduler_lag_ns": max(0, now - next_ns),
-                            "server": process_sample(process.pid), "harness": process_sample(os.getpid())})
+            sample = {"timestamp_ns": now, "scheduler_lag_ns": max(0, now - next_ns),
+                      "server": process_sample(process.pid), "harness": process_sample(os.getpid())}
+            for index, worker in enumerate(workers):
+                sample[f"worker_{index}"] = process_sample(worker.pid)
+            components = [sample["harness"]] + [sample[f"worker_{i}"] for i in range(len(workers))]
+            sample["harness_total"] = {key: sum(component[key] for component in components)
+                                       for key in ("cpu_seconds", "rss_bytes")}
+            samples.append(sample)
         except (OSError, ValueError, IndexError):
             abort.set()
             return
@@ -189,6 +197,7 @@ async def run_once(args, repetition, telemetry_path):
     clients, readers, samples, connectors = [], [], [], []
     process = None
     sampler = None
+    pool = None
     start_ns = end_ns = 0
     abort = asyncio.Event()
     started_line = ""
@@ -218,20 +227,34 @@ async def run_once(args, repetition, telemetry_path):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, capacity)
         connectors = [asyncio.create_task(connect_client(c, args)) for c in clients]
         await asyncio.wait_for(asyncio.gather(*connectors), args.startup_timeout)
+        if args.workers > 1 and len(clients) > 1:
+            from workers import WorkerPool
+            pool = WorkerPool()
+            await pool.start(clients, args)
+            result["worker_pids"] = [worker.pid for worker in pool.processes]
         start_sent_ns = clock_ns()
         start_ns = start_sent_ns + int(args.warmup * 1e9)
         end_ns = start_ns + int(args.duration * 1e9)
         result["window"] = {"start_sent_ns": start_sent_ns, "measurement_start_ns": start_ns,
                             "measurement_end_ns": end_ns, "duration_seconds": args.duration}
-        readers = [asyncio.create_task(read_client(c, args, start_ns, end_ns, abort)) for c in clients]
-        sampler = asyncio.create_task(monitor(process, samples, abort, args.sample_interval))
+        if pool:
+            pool.begin(start_ns, end_ns, abort)
+        else:
+            readers = [asyncio.create_task(read_client(c, args, start_ns, end_ns, abort)) for c in clients]
+        sampler = asyncio.create_task(monitor(process, samples, abort, args.sample_interval,
+                                              pool.processes if pool else (), end_ns))
         await asyncio.get_running_loop().sock_sendall(clients[0].sock, p.encode(p.Start()))
+        if pool:
+            for client in clients:
+                client.sock.close()  # Workers hold transferred duplicates; parent no longer reads them.
         try:
             await asyncio.wait_for(abort.wait(), max(0, (end_ns - clock_ns()) / 1e9))
-            raise RuntimeError("Client validation, sampling, or server process failed before measurement end")
+            if clock_ns() < end_ns:
+                raise RuntimeError("Client validation, sampling, or server process failed before measurement end")
+            result["status"] = "complete"
         except asyncio.TimeoutError:
             result["status"] = "complete"
-    except (OSError, ValueError, RuntimeError, asyncio.TimeoutError) as error:
+    except (OSError, EOFError, ValueError, RuntimeError, asyncio.TimeoutError) as error:
         result["errors"].append(f"{type(error).__name__}: {error}")
     finally:
         # Stop observation before teardown; shutdown traffic never becomes a measured delivery.
@@ -240,6 +263,9 @@ async def run_once(args, repetition, telemetry_path):
         if sampler is not None:
             sampler.cancel()
         await asyncio.gather(*readers, *connectors, *([sampler] if sampler else []), return_exceptions=True)
+        if pool is not None:
+            await pool.finish(early=(not end_ns or clock_ns() < end_ns), timeout=args.shutdown_timeout)
+            result["errors"].extend(pool.errors)
         if process is not None:
             # EOF can precede process reaping; preserve an exiting server's own failure code.
             if result["status"] != "complete" and process.returncode is None:
@@ -290,6 +316,9 @@ async def run_once(args, repetition, telemetry_path):
     if start_ns:
         result["server_resources"] = cpu_summary(samples, "server", start_ns, end_ns)
         result["harness_resources"] = cpu_summary(samples, "harness", start_ns, end_ns)
+        result["harness_total_resources"] = cpu_summary(samples, "harness_total", start_ns, end_ns)
+        result["worker_resources"] = [cpu_summary(samples, f"worker_{i}", start_ns, end_ns)
+                                      for i in range(len(pool.processes) if pool else 0)]
         if result["server_resources"] is None or result["harness_resources"] is None:
             result["errors"].append("Not enough process samples inside the measurement window")
     for client in clients:
@@ -314,6 +343,9 @@ async def run_once(args, repetition, telemetry_path):
     harness = result.get("harness_resources")
     if harness and harness["cpu_percent_one_core"] >= 85:
         result["warnings"].append("Python harness used >=85% of one core; investigate client-side saturation")
+    for index, resources in enumerate(result.get("worker_resources", [])):
+        if resources and resources["cpu_percent_one_core"] >= 85:
+            result["warnings"].append(f"Python client worker {index} used >=85% of one core; investigate saturation")
     if samples:
         result["max_sampler_lag_ns"] = max(s["scheduler_lag_ns"] for s in samples)
     if result.get("server_lifetime_final", {}).get("skipped_ticks", 0):
@@ -345,7 +377,9 @@ def metadata(server, working_tree_status):
             "python": sys.version, "clock": "Linux CLOCK_MONOTONIC nanoseconds", "git_revision": git("rev-parse", "HEAD"),
             "working_tree_status": working_tree_status,
             "executable_sha256": hashlib.sha256(Path(server).read_bytes()).hexdigest(),
-            "compile_commands": commands}
+            "compile_commands": commands,
+            "harness_sha256": {name: hashlib.sha256((ROOT / "bench" / name).read_bytes()).hexdigest()
+                                for name in ("run.py", "metrics.py", "workers.py")}}
 
 
 def arguments():
@@ -353,6 +387,7 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True)
     parser.add_argument("--clients", type=int, default=10)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--max-clients", type=int, default=1024)
     parser.add_argument("--rate", type=int, default=1000)
     parser.add_argument("--mode", choices=("full", "conflated"), default="full")
@@ -379,6 +414,8 @@ def arguments():
         value = getattr(args, name)
         if not math.isfinite(value) or value < 0 or (name != "warmup" and value == 0):
             parser.error(f"{name} must be finite and {'nonnegative' if name == 'warmup' else 'positive'}")
+    if not 1 <= args.workers <= 64:
+        parser.error("workers must be 1..64")
     if not 1 <= args.clients <= 1024 or args.max_clients <= 0 or args.repeats <= 0:
         parser.error("clients must be 1..1024; max-clients and repeats must be positive")
     if not 1 <= args.rate <= 1000000 or not 0 <= args.seed < 2**64:
